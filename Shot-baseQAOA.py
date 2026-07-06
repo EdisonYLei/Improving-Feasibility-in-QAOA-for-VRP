@@ -3,8 +3,25 @@ import itertools
 from math import log, ceil, sqrt
 from scipy.optimize import minimize
 
-from qiskit import QuantumCircuit, transpile
-from qiskit_aer import AerSimulator
+from qiskit import QuantumCircuit
+from qaoa_new_4node_runtime import (
+    CachedStandardShotRunner,
+    DEFAULT_RESULTS_DIR,
+    THREENODE_MAXITER_SWEEP,
+    THREENODE_SHOT_BASE_SEED,
+    THREENODE_SHOT_N_RUNS,
+    THREENODE_SHOT_SEED_TRANSPILER,
+    THREENODE_SHOT_PROTOCOL,
+    build_ideal_shot_simulator,
+    build_results_csv_path,
+    print_experiment_summary,
+    print_maxiter_sweep_selection,
+    save_experiment_csv,
+    standard_noisy_transpile_kwargs,
+    summarize_experiment,
+    threenode_final_seed,
+    threenode_objective_seed,
+)
 
 # ============================================================
 # 0) Problem setup
@@ -129,10 +146,8 @@ def build_qaoa_circuit(gammas, betas, J_zz, h_z, n, energy_scale=1.0, with_measu
     return qc
 
 # ============================================================
-# 3) Aer simulator (ideal, no noise)
+# 3) Ideal shot simulator (cached runner configured below)
 # ============================================================
-
-IDEAL_SIM = AerSimulator()  # Pass seed_simulator per run/eval for reproducibility.
 
 def counts_to_xorder(counts):
     # Qiskit bit order q_{n-1}..q_0 -> variable order q_0..q_{n-1}.
@@ -149,32 +164,6 @@ def expected_energy_from_counts(counts_xorder):
         bits = tuple(int(ch) for ch in xstr)
         e += (c / S) * qubo_cost_from_bits(bits, qubo_const, qubo_linear, qubo_quad)
     return float(e)
-
-def qaoa_objective_shot_based(theta, p, shots_obj, seed_sim, n_batches):
-    gammas = theta[:p]
-    betas = theta[p:]
-
-    vals = []
-    for b in range(n_batches):
-        qc = build_qaoa_circuit(
-            gammas, betas, J_zz, h_z, N_QUBITS,
-            energy_scale=ENERGY_SCALE,
-            with_measurements=True
-        )
-        tqc = transpile(qc, IDEAL_SIM, seed_transpiler=999, optimization_level=1)
-
-        result = IDEAL_SIM.run(
-            tqc,
-            shots=shots_obj,
-            seed_simulator=seed_sim + b
-        ).result()
-
-        counts = result.get_counts()
-        counts_xorder = counts_to_xorder(counts)
-        mean_e = expected_energy_from_counts(counts_xorder)  # Sample mean of QUBO cost.
-        vals.append(mean_e / ENERGY_SCALE)
-
-    return float(np.mean(vals))
 
 # ============================================================
 # 4) Statistics helpers for 30-run summary
@@ -240,150 +229,136 @@ print("Optimal feasible state(s) =", opt_states_feas)
 print("Optimal feasible xstr set =", opt_xstr_set)
 
 # ============================================================
-# 6) Run 30 experiments
+# 6) Run experiments with maxiter sweep
 # ============================================================
 
-# Keep these fixed for fair evaluation (aligned with AerQAOA: same shots and batch size).
+CASE_NAME = "3node_standard_ideal_shot"
+SCALE_TAG = "3node"
+METHOD_TAG = "standard_ideal_shot"
+SUMMARY_TITLE = "Standard QAOA | 3-node | ideal finite-shot"
+
+# Paired with AerQAOA.py: same budget; only simulator differs (ideal vs noisy).
 p = 2
-num_restarts = 8
-shots_obj = 2048
-shots_final = 8192
-batches_obj = 2
-maxiter = 120
-rhobeg = 0.5
-tol = 2e-3
+num_restarts = THREENODE_SHOT_PROTOCOL["num_restarts"]
+shots_obj = THREENODE_SHOT_PROTOCOL["shots_obj"]
+shots_final = THREENODE_SHOT_PROTOCOL["shots_final"]
+batches_obj = THREENODE_SHOT_PROTOCOL["batches_obj"]
+rhobeg = THREENODE_SHOT_PROTOCOL["rhobeg"]
+tol = THREENODE_SHOT_PROTOCOL["tol"]
+seed_transpiler = THREENODE_SHOT_SEED_TRANSPILER
 
-N_RUNS = 30
-BASE_SEED = 12345  # Use same value across methods for paired comparison.
+N_RUNS = THREENODE_SHOT_N_RUNS
+BASE_SEED = THREENODE_SHOT_BASE_SEED
 
-p_star_list = []
-gap_exp_list = []
-run_success_list = []
-tts99_list = []
-rank_list = []
+IDEAL_SIM = build_ideal_shot_simulator()
+STANDARD_IDEAL_TRANSPILE_KWARGS = standard_noisy_transpile_kwargs(seed_transpiler)
+SHOT_RUNNER = CachedStandardShotRunner(
+    p_layers=p,
+    n_qubits=N_QUBITS,
+    J_zz=J_zz,
+    h_z=h_z,
+    energy_scale=ENERGY_SCALE,
+    simulator=IDEAL_SIM,
+    transpile_kwargs=STANDARD_IDEAL_TRANSPILE_KWARGS,
+)
 
-for run_id in range(N_RUNS):
-    seed_run = BASE_SEED + run_id
-    rng = np.random.default_rng(seed_run)
+all_sweep_rows = []
+for maxiter in THREENODE_MAXITER_SWEEP:
+    print(f"\n{'=' * 72}")
+    print(f"[Maxiter sweep | case={CASE_NAME} | maxiter={maxiter} | N_RUNS={N_RUNS}]")
+    print(f"{'=' * 72}")
+    run_records = []
+    for run_id in range(N_RUNS):
+        seed_run = BASE_SEED + run_id
+        rng = np.random.default_rng(seed_run)
 
-    best_result = None
-    best_value = float("inf")
+        best_result = None
+        best_value = float("inf")
 
-    # Multiple restarts with different initial points.
-    for r in range(num_restarts):
-        x0 = np.concatenate([
-            rng.uniform(-np.pi, np.pi, size=p),
-            rng.uniform(0.0, np.pi / 2.0, size=p),
-        ])
+        for r in range(num_restarts):
+            x0 = np.concatenate([
+                rng.uniform(-np.pi, np.pi, size=p),
+                rng.uniform(0.0, np.pi / 2.0, size=p),
+            ])
+            seed_obj = threenode_objective_seed(run_id, r)
+            res = minimize(
+                lambda th, _seed=seed_obj: SHOT_RUNNER.objective_energy(
+                    th,
+                    shots_obj,
+                    _seed,
+                    batches_obj,
+                    expected_energy_from_counts,
+                    counts_to_xorder,
+                ),
+                x0=x0,
+                method="COBYLA",
+                options={"maxiter": maxiter, "rhobeg": rhobeg, "tol": tol}
+            )
+            if res.fun < best_value:
+                best_value = float(res.fun)
+                best_result = res
 
-        # Seed for objective evaluation (depends on run and restart for pairing).
-        seed_obj = 5000 + 100 * r + 10_000 * run_id
-
-        res = minimize(
-            qaoa_objective_shot_based,
-            x0=x0,
-            args=(p, shots_obj, seed_obj, batches_obj),
-            method="COBYLA",
-            options={"maxiter": maxiter, "rhobeg": rhobeg, "tol": tol}
+        counts_xorder = SHOT_RUNNER.run_final(
+            best_result.x,
+            shots_final,
+            threenode_final_seed(run_id),
+            counts_to_xorder,
+        )
+        k_star = sum(counts_xorder.get(xstr, 0) for xstr in opt_xstr_set)
+        p_star = k_star / shots_final
+        gap_exp = expected_energy_from_counts(counts_xorder) - C_star_feas
+        rank = sampling_rank(counts_xorder, opt_xstr_set)
+        run_records.append(
+            {
+                "run_id": run_id + 1,
+                "best_val": best_value,
+                "p_star": p_star,
+                "gap_exp": gap_exp,
+                "success": 1 if k_star >= 1 else 0,
+                "tts99": tts_shots_for_success(p_star),
+                "rank": rank,
+            }
+        )
+        print(
+            f"[Run {run_id+1:02d}/{N_RUNS}] best={best_value:.6f} p*={p_star:.6f} "
+            f"gap={gap_exp:.6f} rank={rank}"
         )
 
-        if res.fun < best_value:
-            best_value = float(res.fun)
-            best_result = res
-
-    best_gammas = best_result.x[:p]
-    best_betas = best_result.x[p:]
-
-    # Final sampling with optimized parameters.
-    final_qc = build_qaoa_circuit(
-        best_gammas, best_betas, J_zz, h_z, N_QUBITS,
-        energy_scale=ENERGY_SCALE,
-        with_measurements=True
+    stats = summarize_experiment(run_records, N_RUNS)
+    all_sweep_rows.append({"lambda": None, "maxiter": maxiter, "stats": stats, "run_records": run_records})
+    print_experiment_summary(SUMMARY_TITLE, stats, "COBYLA", N_RUNS, maxiter)
+    csv_path = build_results_csv_path(
+        CASE_NAME, None, maxiter, scale_tag=SCALE_TAG, method_tag=METHOD_TAG
     )
-    tfinal_qc = transpile(final_qc, IDEAL_SIM, seed_transpiler=999, optimization_level=1)
+    save_experiment_csv(
+        csv_path,
+        CASE_NAME,
+        None,
+        maxiter,
+        "COBYLA",
+        p,
+        num_restarts,
+        N_RUNS,
+        stats,
+        run_records,
+        scale_tag=SCALE_TAG,
+        method_tag=METHOD_TAG,
+    )
+    print(f"[Saved] {csv_path}")
 
-    seed_final = 2026 + 10_000 * run_id  # Per-run final sampling seed.
-    final_result = IDEAL_SIM.run(
-        tfinal_qc,
-        shots=shots_final,
-        seed_simulator=seed_final
-    ).result()
-
-    counts = final_result.get_counts()
-    counts_xorder = counts_to_xorder(counts)
-
-    # Metric (1): optimal-state probability p*.
-    k_star = sum(counts_xorder.get(xstr, 0) for xstr in opt_xstr_set)
-    p_star = k_star / shots_final
-
-    # Metric (2): run-level success (at least one optimal sample).
-    run_success = 1 if k_star >= 1 else 0
-
-    # Metric (3): expected energy gap from final counts.
-    E_hat = expected_energy_from_counts(counts_xorder)
-    gap_exp = E_hat - C_star_feas
-
-    # Metric (4): TTS for 99% success probability.
-    tts99 = tts_shots_for_success(p_star, target=0.99)
-    sampling_rank_run = sampling_rank(counts_xorder, opt_xstr_set)
-
-    p_star_list.append(p_star)
-    run_success_list.append(run_success)
-    gap_exp_list.append(gap_exp)
-    tts99_list.append(tts99)
-    rank_list.append(sampling_rank_run)
-
-    print(f"\n[Run {run_id+1:02d}/{N_RUNS} | seed={seed_run}]")
-    print("  best scaled sampled objective =", best_value)
-    print(f"  p* = {p_star:.6f} (k*={k_star}/{shots_final})  run-success={run_success}")
-    print(f"  E_hat = {E_hat:.6f}  gap_exp = {gap_exp:.6f}")
-    print(f"  TTS99 = {tts99}  sampling_rank = {sampling_rank_run}")
-
-# ============================================================
-# 7) Summarize the four metrics over 30 runs
-# ============================================================
-
-p_mean, p_ci = mean_ci95_t(p_star_list)
-p_std = float(np.std(p_star_list, ddof=1))
-
-succ_k = int(sum(run_success_list))
-succ_rate = succ_k / N_RUNS
-succ_ci = wilson_ci95(succ_k, N_RUNS)
-
-gap_mean, gap_ci = mean_ci95_t(gap_exp_list)
-gap_std = float(np.std(gap_exp_list, ddof=1))
-
-tts_arr = np.asarray(tts99_list, dtype=float)
-finite_tts = tts_arr[np.isfinite(tts_arr)]
-num_inf = int(np.sum(~np.isfinite(tts_arr)))
-
-if len(finite_tts) > 0:
-    tts_median = float(np.median(finite_tts))
-    tts_q25 = float(np.percentile(finite_tts, 25))
-    tts_q75 = float(np.percentile(finite_tts, 75))
-else:
-    tts_median = float("inf")
-    tts_q25 = float("inf")
-    tts_q75 = float("inf")
-
-print("\n" + "="*70)
-print(f"[Summary over {N_RUNS} runs | Shot-based ideal Aer | shots_final={shots_final}]")
-print("="*70)
-
-print("\n(1) Mean optimal-state probability p* (final sampling)")
-print(f"    mean = {p_mean:.6f}, std = {p_std:.6f}, 95% CI = [{p_ci[0]:.6f}, {p_ci[1]:.6f}]")
-
-print("\n(2) Run-level success rate (>=1 optimal sample in final sampling)")
-print(f"    success = {succ_k}/{N_RUNS} = {succ_rate:.6f}, 95% Wilson CI = [{succ_ci[0]:.6f}, {succ_ci[1]:.6f}]")
-
-print("\n(3) Expected energy gap (E[C] - C*_feas) estimated from final counts")
-print(f"    mean = {gap_mean:.6f}, std = {gap_std:.6f}, 95% CI = [{gap_ci[0]:.6f}, {gap_ci[1]:.6f}]")
-
-print("\n(4) TTS shots for >=99% success (derived from p*), report finite median/IQR")
-print(f"    median = {tts_median:.2f}, IQR = [{tts_q25:.2f}, {tts_q75:.2f}], #inf (p*=0) = {num_inf}/{N_RUNS}")
-
-rank_mean, rank_ci = mean_ci95_t(rank_list)
-rank_std = float(np.std(rank_list, ddof=1))
-print("\n(5) Sampling rank (rank of optimal among bitstrings by frequency, 1=most frequent)")
-print(f"    mean = {rank_mean:.2f}, std = {rank_std:.2f}, 95% CI = [{rank_ci[0]:.2f}, {rank_ci[1]:.2f}]")
-print("="*70)
+print_maxiter_sweep_selection(
+    CASE_NAME,
+    all_sweep_rows,
+    summary_title=SUMMARY_TITLE,
+    optimizer="COBYLA",
+    n_runs=N_RUNS,
+    output_dir=DEFAULT_RESULTS_DIR,
+    scale_tag=SCALE_TAG,
+    method_tag=METHOD_TAG,
+    save_experiment_csv_fn=save_experiment_csv,
+    experiment_meta={
+        "p": p,
+        "num_restarts": num_restarts,
+        "n_runs": N_RUNS,
+    },
+)

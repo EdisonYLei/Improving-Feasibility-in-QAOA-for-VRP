@@ -3,9 +3,26 @@ import itertools
 from math import log, ceil, sqrt
 from scipy.optimize import minimize
 
-from qiskit import QuantumCircuit, transpile
-from qiskit_aer import AerSimulator
-from qiskit_aer.noise import NoiseModel, ReadoutError, depolarizing_error
+from qiskit import QuantumCircuit
+from qaoa_new_4node_runtime import (
+    CachedInitializeProposedShotRunner,
+    DEFAULT_RESULTS_DIR,
+    THREENODE_LAMBDA_LIST,
+    THREENODE_MAXITER_SWEEP,
+    THREENODE_SHOT_PROTOCOL,
+    THREENODE_SHOT_BASE_SEED,
+    THREENODE_SHOT_N_RUNS,
+    THREENODE_SHOT_SEED_TRANSPILER,
+    build_proposed_noisy_simulator,
+    proposed_noisy_transpile_kwargs,
+    print_experiment_summary,
+    print_hyperparam_sweep_selection,
+    save_experiment_csv,
+    select_best_config_by_gap_mean,
+    summarize_experiment,
+    threenode_final_seed,
+    threenode_objective_seed,
+)
 
 
 _HAS_MPL = False
@@ -27,7 +44,6 @@ qubo_quad = {(2,4):1306.8,(0,1):871.2,(2,3):871.2,(0,5):871.2,(4,5):871.2,(1,3):
 
 ENERGY_SCALE = 435.6
 INIT_STATES = ["000101", "100110", "011001", "111010"]
-LAMBDA = 0.4
 
 # ===================== Utilities =====================
 
@@ -122,7 +138,7 @@ def apply_cost_layer(qc, gamma):
         if abs(hs) > 1e-12:
             qc.rz(2.0 * gamma * hs, i)
 
-def apply_custom_mixer(qc, beta, lam=LAMBDA):
+def apply_custom_mixer(qc, beta, lam):
     qc.rxx(2.0 * beta, 2, 3)
     qc.ryy(2.0 * beta, 2, 3)
     qc.rxx(2.0 * beta, 4, 5)
@@ -130,12 +146,12 @@ def apply_custom_mixer(qc, beta, lam=LAMBDA):
     qc.rx(2.0 * beta * lam, 0)
     qc.rx(2.0 * beta * lam, 1)
 
-def build_qaoa_circuit(gammas, betas, with_measurements=True):
+def build_qaoa_circuit(gammas, betas, lam, with_measurements=True):
     qc = QuantumCircuit(N_QUBITS)
     qc.initialize(psi0_vec, list(range(N_QUBITS)))
     for l in range(len(gammas)):
         apply_cost_layer(qc, gammas[l])
-        apply_custom_mixer(qc, betas[l], lam=LAMBDA)
+        apply_custom_mixer(qc, betas[l], lam=lam)
     if with_measurements:
         qc.measure_all()
     return qc
@@ -144,76 +160,23 @@ def build_qaoa_circuit(gammas, betas, with_measurements=True):
 def save_circuit_diagram(qc, filepath="qaoa_circuit.pdf", fold=-1, dpi=150):
     """Generate and save the circuit diagram as PDF (requires matplotlib). Behavior matches AerQAOA.py."""
     if not _HAS_MPL:
-        print("[Circuit] 未安装 matplotlib，无法生成 PDF。请安装: pip install matplotlib")
+        print("[Circuit] matplotlib is not installed; cannot export PDF. Install with: pip install matplotlib")
         return False
     try:
         fig = qc.draw(output="mpl", fold=fold)
         fig.savefig(filepath, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
-        print(f"[Circuit] 电路图已保存: {filepath}")
+        print(f"[Circuit] Circuit diagram saved: {filepath}")
         return True
     except Exception as e:
-        print(f"[Circuit] 保存 PDF 失败: {e}")
+        print(f"[Circuit] Failed to save PDF: {e}")
         return False
 
 
-# ===================== Noise model =====================
+# ===================== Noisy simulator (cached runner configured below) =====================
 
-def build_custom_noise_model():
-    noise_model = NoiseModel()
-
-    # Symmetric readout error: p01 = p10 = 0.001 (~99.9% readout fidelity).
-    p01, p10 = 0.001, 0.001
-    ro_err = ReadoutError([[1 - p01, p01],
-                           [p10, 1 - p10]])
-    for q in range(N_QUBITS):
-        noise_model.add_readout_error(ro_err, [q])
-
-    # Single-qubit depolarizing: mean gate infidelity r̄₁ = p₁/2 (Qiskit Aer λ).
-    p1 = 0.00015  # r̄₁ = p₁/2 ≈ 7.5e-5 (single-qubit infidelity)
-    err_1q = depolarizing_error(p1, 1)
-    for gate in ["h", "rz", "rx"]:
-        noise_model.add_all_qubit_quantum_error(err_1q, gate)
-
-    # Two-qubit depolarizing: mean gate infidelity r̄₂ = 3p₂/4 (Qiskit Aer λ).
-    p2 = 0.00125  # r̄₂ = 3p₂/4 ≈ 9.375e-4 (two-qubit infidelity)
-    err_2q = depolarizing_error(p2, 2)
-    for gate in ["rzz", "rxx", "ryy"]:
-        noise_model.add_all_qubit_quantum_error(err_2q, gate)
-
-    return noise_model
-
-noise_model = build_custom_noise_model()
-
-# IMPORTANT: Do not fix seed_simulator here; pass it per run() for paired reproducibility.
-NOISY_SIM = AerSimulator(noise_model=noise_model)
-
-def transpile_for_noisy(qc, seed_transpiler=999):
-    return transpile(
-        qc,
-        seed_transpiler=seed_transpiler,
-        optimization_level=1,
-        basis_gates=["h", "rz", "rx", "rzz", "rxx", "ryy"]
-    )
-
-# ===================== Noisy objective =====================
-
-def qaoa_objective_noisy(theta, p, shots_obj, seed, batches, seed_transpiler=999):
-    gammas = theta[:p]
-    betas = theta[p:]
-    vals = []
-    for b in range(batches):
-        qc = build_qaoa_circuit(gammas, betas, with_measurements=True)
-        tqc = transpile_for_noisy(qc, seed_transpiler=seed_transpiler)
-        result = NOISY_SIM.run(
-            tqc,
-            shots=shots_obj,
-            seed_simulator=seed + b
-        ).result()
-        counts = result.get_counts()
-        counts_x = counts_to_xorder(counts)
-        vals.append(expected_energy_from_counts(counts_x) / ENERGY_SCALE)
-    return float(np.mean(vals))
+XY_PAIRS = [(2, 3), (4, 5)]
+DEPOT_QUBITS = [0, 1]
 
 # ===================== Statistics helpers (same four metrics) =====================
 
@@ -270,7 +233,7 @@ opt_xstr_set = {bits_to_xstr(s) for s in opt_states_feas}
 # Generate example circuit diagram (p=2, default angles; failure does not affect subsequent runs).
 _example_g = [0.1, 0.2]
 _example_b = [0.3, 0.4]
-qc_example = build_qaoa_circuit(_example_g, _example_b, with_measurements=True)
+qc_example = build_qaoa_circuit(_example_g, _example_b, 0.8, with_measurements=True)
 save_circuit_diagram(qc_example, filepath="qaoa_circuit_new_example.pdf", fold=-1, dpi=150)
 
 print("\n[Feasible optimum]")
@@ -278,145 +241,148 @@ print("C*_feas =", C_star_feas)
 print("Optimal feasible state(s) =", opt_states_feas)
 print("Optimal feasible xstr set =", opt_xstr_set)
 
-# ===================== Run 30 experiments (paired) =====================
+CASE_NAME = "3node_proposed_noisy"
+SCALE_TAG = "3node"
+METHOD_TAG = "proposed_noisy"
+SUMMARY_TITLE = "Proposed QAOA | 3-node | noisy finite-shot"
+OPTIMIZER = "COBYLA"
 
-# Keep these consistent with the previous noisy baseline for fair comparison.
+# Paired with AerQAOA.py / Shot-baseQAOA-new.py: THREENODE_SHOT_PROTOCOL (ideal differs only in simulator).
 p = 2
-num_restarts = 8
-shots_obj = 2048
-shots_final = 8192
-batches_obj = 2
-maxiter = 120
-rhobeg = 0.5
-tol = 2e-3
-seed_transpiler = 999
+num_restarts = THREENODE_SHOT_PROTOCOL["num_restarts"]
+shots_obj = THREENODE_SHOT_PROTOCOL["shots_obj"]
+shots_final = THREENODE_SHOT_PROTOCOL["shots_final"]
+batches_obj = THREENODE_SHOT_PROTOCOL["batches_obj"]
+rhobeg = THREENODE_SHOT_PROTOCOL["rhobeg"]
+tol = THREENODE_SHOT_PROTOCOL["tol"]
+seed_transpiler = THREENODE_SHOT_SEED_TRANSPILER
 
-N_RUNS = 30
-BASE_SEED = 12345  # Use same value as baseline for paired comparison.
+N_RUNS = THREENODE_SHOT_N_RUNS
+BASE_SEED = THREENODE_SHOT_BASE_SEED
 
-p_star_list = []
-gap_exp_list = []
-run_success_list = []
-tts99_list = []
-rank_list = []
+NOISY_SIM = build_proposed_noisy_simulator(N_QUBITS)
+PROPOSED_NOISY_TRANSPILE_KWARGS = proposed_noisy_transpile_kwargs(seed_transpiler)
 
-for run_id in range(N_RUNS):
-    seed_run = BASE_SEED + run_id
-    rng = np.random.default_rng(seed_run)
+all_sweep_rows = []
+for lam in THREENODE_LAMBDA_LIST:
+    SHOT_RUNNER = CachedInitializeProposedShotRunner(
+        psi0_vec=psi0_vec,
+        p_layers=p,
+        n_qubits=N_QUBITS,
+        lam=lam,
+        xy_pairs=XY_PAIRS,
+        depot_qubits=DEPOT_QUBITS,
+        J_zz=J_zz,
+        h_z=h_z,
+        energy_scale=ENERGY_SCALE,
+        simulator=NOISY_SIM,
+        transpile_kwargs=PROPOSED_NOISY_TRANSPILE_KWARGS,
+    )
 
-    best_val = float("inf")
-    best_res = None
+    lam_sweep_rows = []
 
-    for r in range(num_restarts):
-        x0 = np.concatenate([
-            rng.uniform(-np.pi, np.pi, size=p),
-            rng.uniform(0.0, np.pi/2.0, size=p),
-        ])
-
-        # Objective evaluation seed (paired with baseline).
-        seed_obj = 7000 + 100 * r + 10_000 * run_id
-
-        res = minimize(
-            qaoa_objective_noisy, x0=x0,
-            args=(p, shots_obj, seed_obj, batches_obj, seed_transpiler),
-            method="COBYLA",
-            options={"maxiter": maxiter, "rhobeg": rhobeg, "tol": tol}
+    for maxiter in THREENODE_MAXITER_SWEEP:
+        print(f"\n{'=' * 72}")
+        print(
+            f"[Lambda sweep | case={CASE_NAME} | lambda={lam:g} | "
+            f"maxiter={maxiter} | N_RUNS={N_RUNS}]"
         )
+        print(f"{'=' * 72}")
 
-        if res.fun < best_val:
-            best_val = float(res.fun)
-            best_res = res
+        run_records = []
+        qc_final = None
+        for run_id in range(N_RUNS):
+            seed_run = BASE_SEED + run_id
+            rng = np.random.default_rng(seed_run)
 
-    best_g = best_res.x[:p]
-    best_b = best_res.x[p:]
+            best_val = float("inf")
+            best_res = None
 
-    # Final sampling seed (paired with baseline).
-    seed_final = 2026 + 10_000 * run_id
+            for r in range(num_restarts):
+                x0 = np.concatenate([
+                    rng.uniform(-np.pi, np.pi, size=p),
+                    rng.uniform(0.0, np.pi/2.0, size=p),
+                ])
+                seed_obj = threenode_objective_seed(run_id, r)
+                res = minimize(
+                    lambda th: SHOT_RUNNER.objective_energy(
+                        th,
+                        shots_obj,
+                        seed_obj,
+                        batches_obj,
+                        expected_energy_from_counts,
+                        counts_to_xorder,
+                    ),
+                    x0=x0,
+                    method="COBYLA",
+                    options={"maxiter": maxiter, "rhobeg": rhobeg, "tol": tol}
+                )
+                if res.fun < best_val:
+                    best_val = float(res.fun)
+                    best_res = res
 
-    qc_final = build_qaoa_circuit(best_g, best_b, with_measurements=True)
-    tqc_final = transpile_for_noisy(qc_final, seed_transpiler=seed_transpiler)
+            best_g = best_res.x[:p]
+            best_b = best_res.x[p:]
+            seed_final = threenode_final_seed(run_id)
+            qc_final = build_qaoa_circuit(best_g, best_b, lam, with_measurements=True)
+            counts_x = SHOT_RUNNER.run_final(
+                best_res.x,
+                shots_final,
+                seed_final,
+                counts_to_xorder,
+            )
+            k_star = sum(counts_x.get(xstr, 0) for xstr in opt_xstr_set)
+            p_star = k_star / shots_final
+            gap_exp = expected_energy_from_counts(counts_x) - C_star_feas
+            rank = sampling_rank(counts_x, opt_xstr_set)
+            run_records.append(
+                {
+                    "run_id": run_id + 1,
+                    "best_val": best_val,
+                    "p_star": p_star,
+                    "gap_exp": gap_exp,
+                    "success": 1 if k_star >= 1 else 0,
+                    "tts99": tts_shots_for_success(p_star),
+                    "rank": rank,
+                }
+            )
+            print(
+                f"[Run {run_id+1:02d}/{N_RUNS}] best={best_val:.6f} p*={p_star:.6f} "
+                f"gap={gap_exp:.6f} rank={rank}"
+            )
 
-    final = NOISY_SIM.run(
-        tqc_final,
-        shots=shots_final,
-        seed_simulator=seed_final
-    ).result()
+        if qc_final is not None:
+            save_circuit_diagram(qc_final, filepath="qaoa_circuit_new_optimized.pdf", fold=-1, dpi=1200)
 
-    counts = final.get_counts()
-    counts_x = counts_to_xorder(counts)
+        stats = summarize_experiment(run_records, N_RUNS)
+        row = {"lambda": lam, "maxiter": maxiter, "stats": stats, "run_records": run_records}
+        lam_sweep_rows.append(row)
+        all_sweep_rows.append(row)
+        print_experiment_summary(SUMMARY_TITLE, stats, OPTIMIZER, N_RUNS, maxiter)
 
-    # Compute the four evaluation metrics.
-    k_star = sum(counts_x.get(xstr, 0) for xstr in opt_xstr_set)
-    p_star = k_star / shots_final
-    run_success = 1 if k_star >= 1 else 0
+    best_for_lambda = select_best_config_by_gap_mean(lam_sweep_rows)
+    print(
+        f"[Selection | lambda={lam:g}] best maxiter={best_for_lambda['maxiter']} "
+        f"gap_mean={best_for_lambda['stats']['gap_mean']:.6f}"
+    )
 
-    E_hat = expected_energy_from_counts(counts_x)
-    gap_exp = E_hat - C_star_feas
-
-    tts99 = tts_shots_for_success(p_star, target=0.99)
-    sampling_rank_run = sampling_rank(counts_x, opt_xstr_set)
-
-    p_star_list.append(p_star)
-    run_success_list.append(run_success)
-    gap_exp_list.append(gap_exp)
-    tts99_list.append(tts99)
-    rank_list.append(sampling_rank_run)
-
-    print(f"\n[Run {run_id+1:02d}/{N_RUNS} | seed={seed_run}]")
-    print("  best scaled sampled objective =", best_val)
-    print(f"  p* = {p_star:.6f} (k*={k_star}/{shots_final})  run-success={run_success}")
-    print(f"  E_hat = {E_hat:.6f}  gap_exp = {gap_exp:.6f}")
-    print(f"  TTS99 = {tts99}  sampling_rank = {sampling_rank_run}")
-
-# Save the optimized circuit diagram from the last run.
-save_circuit_diagram(qc_final, filepath="qaoa_circuit_new_optimized.pdf", fold=-1, dpi=1200)
-
-# ===================== Summary =====================
-
-p_mean, p_ci = mean_ci95_t(p_star_list)
-p_std = float(np.std(p_star_list, ddof=1))
-
-succ_k = int(sum(run_success_list))
-succ_rate = succ_k / N_RUNS
-succ_ci = wilson_ci95(succ_k, N_RUNS)
-
-gap_mean, gap_ci = mean_ci95_t(gap_exp_list)
-gap_std = float(np.std(gap_exp_list, ddof=1))
-
-tts_arr = np.asarray(tts99_list, dtype=float)
-finite_tts = tts_arr[np.isfinite(tts_arr)]
-num_inf = int(np.sum(~np.isfinite(tts_arr)))
-
-if len(finite_tts) > 0:
-    tts_median = float(np.median(finite_tts))
-    tts_q25 = float(np.percentile(finite_tts, 25))
-    tts_q75 = float(np.percentile(finite_tts, 75))
-else:
-    tts_median = float("inf")
-    tts_q25 = float("inf")
-    tts_q75 = float("inf")
-
-print("\n" + "="*70)
-print(f"[Summary over {N_RUNS} runs | Noisy NEW init+mixer | shots_final={shots_final}]")
-print("="*70)
-
-print("\n(1) Mean optimal-state probability p* (final sampling)")
-print(f"    mean = {p_mean:.6f}, std = {p_std:.6f}, 95% CI = [{p_ci[0]:.6f}, {p_ci[1]:.6f}]")
-
-print("\n(2) Run-level success rate (>=1 optimal sample in final sampling)")
-print(f"    success = {succ_k}/{N_RUNS} = {succ_rate:.6f}, 95% Wilson CI = [{succ_ci[0]:.6f}, {succ_ci[1]:.6f}]")
-
-print("\n(3) Expected energy gap (E[C] - C*_feas) estimated from final counts")
-print(f"    mean = {gap_mean:.6f}, std = {gap_std:.6f}, 95% CI = [{gap_ci[0]:.6f}, {gap_ci[1]:.6f}]")
-
-print("\n(4) TTS shots for >=99% success (derived from p*), report finite median/IQR")
-print(f"    median = {tts_median:.2f}, IQR = [{tts_q25:.2f}, {tts_q75:.2f}], #inf (p*=0) = {num_inf}/{N_RUNS}")
-
-rank_mean, rank_ci = mean_ci95_t(rank_list)
-rank_std = float(np.std(rank_list, ddof=1))
-print("\n(5) Sampling rank (rank of optimal among bitstrings by frequency, 1=most frequent)")
-print(f"    mean = {rank_mean:.2f}, std = {rank_std:.2f}, 95% CI = [{rank_ci[0]:.2f}, {rank_ci[1]:.2f}]")
-print("="*70)
+print_hyperparam_sweep_selection(
+    CASE_NAME,
+    THREENODE_LAMBDA_LIST,
+    all_sweep_rows,
+    summary_title=SUMMARY_TITLE,
+    optimizer=OPTIMIZER,
+    n_runs=N_RUNS,
+    scale_tag=SCALE_TAG,
+    method_tag=METHOD_TAG,
+    output_dir=DEFAULT_RESULTS_DIR,
+    save_experiment_csv_fn=save_experiment_csv,
+    experiment_meta={
+        "p": p,
+        "num_restarts": num_restarts,
+        "n_runs": N_RUNS,
+    },
+)
 
 print("\n[Noise model summary]")
-print(noise_model)
+print("proposed noisy Aer: readout p01=p10=0.001, 1q depolarizing 0.00015, 2q rzz/rxx/ryy 0.00125")
