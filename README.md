@@ -15,13 +15,11 @@ If you use this code in your research, please ensure to cite the referenced work
 
 ```bibtex
 @article{lei2026improving,
-  title={Improving Feasibility in Quantum Approximate Optimization Algorithm for Vehicle Routing via Constraint-Aware Initialization and Hybrid XY-X Mixing},
-  author={Lei, Yuan-Zheng and Gong, Yaobang and Yang, Xianfeng Terry and Attoh-Okine, Nii},
-  journal={arXiv preprint arXiv:2604.07218},
-  year={2026},
-  doi={10.48550/arXiv.2604.07218},
-  archivePrefix={arXiv},
-  eprint={2604.07218},
-  primaryClass={cs.ET}
+  title   = {Improving feasibility in the quantum approximate optimization algorithm for vehicle routing via constraint-aware initialization and hybrid {XY--X} mixing},
+  author  = {Lei, Yuan-Zheng and Gong, Yaobang and Yang, Xianfeng Terry and Attoh-Okine, Nii},
+  journal = {Transportation Research Part C: Emerging Technologies},
+  volume  = {194},
+  pages   = {106047},
+  year    = {2027}
 }
 ```
