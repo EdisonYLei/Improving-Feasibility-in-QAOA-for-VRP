@@ -11,7 +11,7 @@ pip install -r requirements.txt
 ```
 ### Citation
 
-If you use this code in your research, please ensure to cite the referenced works accordingly. For our paper titled *"Improving Feasibility in Quantum Approximate Optimization Algorithm for Vehicle Routing via Constraint-Aware Initialization and Hybrid XY-X Mixing"* please use the following citation details:
+If you use this code in your research, you are welcome to cite the referenced works accordingly. For our paper titled *"Improving Feasibility in Quantum Approximate Optimization Algorithm for Vehicle Routing via Constraint-Aware Initialization and Hybrid XY-X Mixing"* please use the following citation details:
 
 ```bibtex
 @article{lei2026improving,
